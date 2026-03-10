@@ -1,0 +1,338 @@
+sequenceDiagram
+    autonumber
+    actor User
+    participant UI as User Interface
+    participant API as FastAPI Router
+    participant Service as MazeService
+    participant Utils as Utils
+    participant QC as QueryConstructor
+    participant DA as DataAccess
+    participant DB as Database
+
+    Note over User,DB: 🔍 GET - Detailed Flow
+
+    User->>UI: Clicks component
+    activate UI
+    UI->>API: GET /component?componentID=x
+    activate API
+    API->>Service: get_data('Component', None, format_object={componentID:x})
+    activate Service
+
+    Note over Service,DB: Step 1 - Fetch Query Config from x000005
+    Service->>DA: fetch_query_config('Component')
+    activate DA
+    DA->>DB: SELECT from x000005 WHERE type='Component'
+    activate DB
+    DB-->>DA: query, formatter, param_to_field_mapping, order_by
+    deactivate DB
+    DA-->>Service: QueryModel or raise SqlAlchemyException (retries 3x)
+    deactivate DA
+    alt SqlAlchemyException
+        Service-->>API: 500 Internal Server Error
+        API-->>UI: Error
+        UI-->>User: Error message
+    else Success
+        Note over Service,QC: Step 2 - Build Final SQL
+        Service->>QC: create_where_clause(query, column, value)
+        activate QC
+        QC-->>Service: SQL + WHERE or unchanged
+        deactivate QC
+        Service->>QC: create_order_by_clause(query, order_by)
+        activate QC
+        QC-->>Service: SQL + ORDER BY or unchanged
+        deactivate QC
+        Service->>QC: create_formatted_sql(query_object, format_object)
+        activate QC
+        QC->>QC: map params + evaluate formatter + substitute values
+        QC-->>Service: final executable SQL
+        deactivate QC
+
+        Note over Service,DB: Step 3 - Execute Query
+        Service->>DA: fetch_all(final_sql)
+        activate DA
+        DA->>DB: SELECT from Component table
+        activate DB
+        DB-->>DA: rows or SQLAlchemyError
+        deactivate DB
+        DA-->>Service: rows or raise SqlAlchemyException (retries 3x)
+        deactivate DA
+        alt SqlAlchemyException
+            Service-->>API: 500 Internal Server Error
+            API-->>UI: Error
+            UI-->>User: Error message
+        else result is empty
+            Service-->>API: []
+            API-->>UI: 200 OK + []
+            UI-->>User: No data found
+        else Success
+            Service-->>API: output list of dicts
+            API-->>UI: 200 OK + result
+            UI-->>User: Display component data
+        end
+    end
+    deactivate Service
+    deactivate API
+    deactivate UI
+
+    Note over User,DB: ➕ POST - Detailed Flow
+
+    User->>UI: Submit form
+    activate UI
+    UI->>API: POST /component {input: [{column_config_id, value}]}
+    activate API
+    API->>Service: insert_data(json_object)
+    activate Service
+
+    Note over Service,Utils: Step 1 - Validate Payload
+    Service->>Utils: extract_generic_tables_data(data, session)
+    activate Utils
+    Utils->>Utils: get_config_data_object(input)
+    alt column_config_id not integer
+        Utils-->>Service: raise ValueError Invalid Payload
+        Service-->>API: raise Exception
+        API-->>UI: HTTPException + detail
+        UI-->>User: Invalid Payload error
+    else valid
+        Note over Utils,DB: Step 2 - Fetch Field Config from x000003
+        Utils->>DA: fetch_all(get_save_edit_data WHERE column_config_id IN (...))
+        activate DA
+        DA->>DB: SELECT from x000003 WHERE column_config_id IN (...)
+        activate DB
+        DB-->>DA: field definitions (table_name, parent_table_name, pkey, fkey, column mappings)
+        deactivate DB
+        DA-->>Utils: response_list
+        deactivate DA
+
+        Note over Utils: Step 3 - Build Insert List
+        Utils->>Utils: group columns by table_name
+        Utils->>Utils: cast values per column type
+        Utils->>Utils: handle geom column as raw WKT
+        Utils->>Utils: sort parent table first (parent_table_name is None)
+        Utils-->>Service: insert_list [{table, column_name_value, pkey, fkey}]
+        deactivate Utils
+    end
+
+    Note over Service,DB: Step 4 - Insert Parent Table
+    Service->>QC: create_insert_sql(parent_table_data) + RETURNING pkey
+    activate QC
+    QC-->>Service: parent INSERT SQL
+    deactivate QC
+    Service->>DA: insert_update_record(session, sql, return_id=True)
+    activate DA
+    DA->>DB: INSERT into Parent Table RETURNING primary_key
+    activate DB
+    DB-->>DA: parent_insert_id or SQLAlchemyError
+    deactivate DB
+    DA-->>Service: parent_insert_id or raise Exception
+    deactivate DA
+    alt Error
+        Service->>DA: session.rollback()
+        Service-->>API: raise Exception
+        API-->>UI: HTTPException + mazeresponse detail
+        UI-->>User: Error message
+    else Success
+        Note over Service,DB: Step 5 - Insert Child Table
+        Service->>QC: create_insert_sql(child_data + fkey=parent_insert_id)
+        activate QC
+        QC-->>Service: child INSERT SQL
+        deactivate QC
+        Service->>DA: insert_update_record(session, sql, return_id)
+        activate DA
+        DA->>DB: INSERT into Child Table (fkey = parent_insert_id)
+        activate DB
+        DB-->>DA: child_insert_id or SQLAlchemyError
+        deactivate DB
+        DA-->>Service: child_insert_id or raise Exception
+        deactivate DA
+        alt Error
+            Service->>DA: session.rollback()
+            Service-->>API: raise Exception
+            API-->>UI: HTTPException + mazeresponse detail
+            UI-->>User: Error message
+        else Success
+            Note over Service,DB: Step 6 - Optional Form/Task Handling
+            alt formid present in request
+                Service->>QC: construct_form_dict(taskid)
+                activate QC
+                QC-->>Service: form_dict
+                deactivate QC
+                Service->>DA: insert_update_record(session, form_sql, True)
+                activate DA
+                DA->>DB: INSERT into Form Table RETURNING form_id
+                activate DB
+                DB-->>DA: form_id
+                deactivate DB
+                DA-->>Service: form_id
+                deactivate DA
+                Service->>QC: construct_form_transaction_dict(assetid, workid, taskid, insert_id, form_id)
+                activate QC
+                QC-->>Service: form_transaction_dict
+                deactivate QC
+                Service->>DA: insert_update_record(session, form_transaction_sql, True)
+                activate DA
+                DA->>DB: INSERT into Form Transaction Table
+                activate DB
+                DB-->>DA: transaction_id
+                deactivate DB
+                DA-->>Service: transaction_id
+                deactivate DA
+            else formid not present
+                Note over Service: Skip form/task handling
+            end
+            Note over Service,DB: Step 7 - Commit
+            Service->>DA: session.commit()
+            activate DA
+            DA-->>Service: committed
+            deactivate DA
+            Service-->>API: {id, status_code, "Data Inserted Successfully"}
+            API-->>UI: 201 Created + response
+            UI-->>User: Success message
+        end
+    end
+    deactivate Service
+    deactivate API
+    deactivate UI
+
+    Note over User,DB: ✏️ PUT - Detailed Flow
+
+    User->>UI: Edit and submit form
+    activate UI
+    UI->>API: PUT /component {input: [{column_config_id, value}], id, operation}
+    activate API
+    API->>Service: update_data(json_object)
+    activate Service
+
+    Note over Service,Utils: Step 1 - Validate Payload
+    Service->>Utils: extract_generic_tables_data(data, session)
+    activate Utils
+    Utils->>Utils: get_config_data_object(input)
+    alt column_config_id not integer
+        Utils-->>Service: raise ValueError Invalid Payload
+        Service-->>API: raise Exception
+        API-->>UI: HTTPException + detail
+        UI-->>User: Invalid Payload error
+    else valid
+        Note over Utils,DB: Step 2 - Fetch Field Config from x000003
+        Utils->>DA: fetch_all(get_save_edit_data WHERE column_config_id IN (...))
+        activate DA
+        DA->>DB: SELECT from x000003 WHERE column_config_id IN (...)
+        activate DB
+        DB-->>DA: field definitions (table_name, parent_table_name, pkey, fkey, column mappings)
+        deactivate DB
+        DA-->>Utils: response_list
+        deactivate DA
+        Note over Utils: Step 3 - Build Insert List
+        Utils->>Utils: group columns by table_name
+        Utils->>Utils: cast values + handle geom
+        Utils->>Utils: sort parent table first
+        Utils-->>Service: insert_list [{table, column_name_value, pkey, fkey}]
+        deactivate Utils
+    end
+
+    Note over Service,DB: Step 4 - Operation Based Routing
+    Service->>QC: build operation SQL (based on operation type)
+    activate QC
+    QC-->>Service: SQL
+    deactivate QC
+    Service->>DA: insert_update_record(session, sql, return_id)
+    activate DA
+    DA->>DB: Execute operation query
+    activate DB
+    DB-->>DA: result or SQLAlchemyError
+    deactivate DB
+    DA-->>Service: result or raise SqlAlchemyException
+    deactivate DA
+
+    alt operation = Update_Insert
+        Service-->>Service: UPDATE Parent + INSERT Child done
+    else operation = Insert_Update
+        alt parent_table_name is None
+            Service->>DA: session.rollback()
+            Service-->>API: {response: "Parent table name is blank"}
+            API-->>UI: 202 Accepted + error response
+            UI-->>User: Configuration error message
+        else parent found
+            Service->>DA: insert_update_record(session, parent_child_sql, False)
+            activate DA
+            DA->>DB: UPDATE Parent-Child relationship
+            activate DB
+            DB-->>DA: done
+            deactivate DB
+            DA-->>Service: done
+            deactivate DA
+        end
+    else operation = Update_Update
+        Service-->>Service: UPDATE Parent + UPDATE Child done
+    else operation = Update_Update_Extended
+        Service->>DA: insert_update_record(session, state_sql, False)
+        activate DA
+        DA->>DB: UPDATE State separately
+        activate DB
+        DB-->>DA: done
+        deactivate DB
+        DA-->>Service: done
+        deactivate DA
+    else operation = Child_Update_Parent
+        Service-->>Service: Child drives Parent UPDATE done
+    else operation = Reset_Update
+        Service->>DA: insert_update_record(session, reset_sql, False)
+        activate DA
+        DA->>DB: RESET fields to NULL
+        activate DB
+        DB-->>DA: done
+        deactivate DB
+        DA-->>Service: done
+        deactivate DA
+        Service->>DA: insert_update_record(session, update_sql, False)
+        activate DA
+        DA->>DB: UPDATE with new values
+        activate DB
+        DB-->>DA: done
+        deactivate DB
+        DA-->>Service: done
+        deactivate DA
+    else operation = Insert
+        Service-->>Service: INSERT RETURNING insert_id done
+    else default - plain UPDATE
+        Service->>DA: fetch_all(SELECT EXISTS WHERE pkey=id)
+        activate DA
+        DA->>DB: CHECK record exists in table
+        activate DB
+        DB-->>DA: true or false
+        deactivate DB
+        DA-->>Service: exists result
+        deactivate DA
+        alt record does not exist
+            Service-->>API: raise ValueError(id does not exist)
+            API-->>UI: 404 Not Found
+            UI-->>User: Not found error
+        else record exists
+            Service->>DA: insert_update_record(session, update_sql, False)
+            activate DA
+            DA->>DB: UPDATE Component table
+            activate DB
+            DB-->>DA: done
+            deactivate DB
+            DA-->>Service: done
+            deactivate DA
+        end
+    end
+
+    Note over Service,DB: Step 5 - Commit or Rollback
+    alt SqlAlchemyException
+        Service->>DA: session.rollback()
+        Service-->>API: raise SqlAlchemyException
+        API-->>UI: HTTPException + mazeresponse detail
+        UI-->>User: Error message
+    else Success
+        Service->>DA: session.commit()
+        activate DA
+        DA-->>Service: committed
+        deactivate DA
+        Service-->>API: {response: "Data Inserted/Updated Successfully"}
+        API-->>UI: 202 Accepted + response
+        UI-->>User: Confirmation message
+    end
+    deactivate Service
+    deactivate API
+    deactivate UI
