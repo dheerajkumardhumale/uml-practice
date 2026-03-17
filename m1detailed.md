@@ -2,7 +2,8 @@
 sequenceDiagram
     autonumber
     actor User
-    participant UI as User Interface
+    participant UI as Angular Component
+    participant SVC as DataService
     participant API as FastAPI Router
     participant Service as MazeService
     participant Utils as Utils
@@ -14,7 +15,10 @@ sequenceDiagram
 
     User->>UI: Clicks component
     activate UI
-    UI->>API: GET /component?componentID=x
+    UI->>SVC: getData(BASE_URL + journey)
+    activate SVC
+    Note over SVC: Wraps http.get() in Promise<br/>Attaches Ocp-Apim-Subscription-Key header
+    SVC->>API: GET /component?componentID=x
     activate API
     API->>Service: get_data('Component', None, format_object={componentID:x})
     activate Service
@@ -30,7 +34,8 @@ sequenceDiagram
     deactivate DA
     alt SqlAlchemyException
         Service-->>API: 500 Internal Server Error
-        API-->>UI: Error
+        API-->>SVC: reject(error)
+        SVC-->>UI: Promise rejects
         UI-->>User: Error message
     else Success
         Note over Service,QC: Step 2 - Build Final SQL
@@ -59,27 +64,34 @@ sequenceDiagram
         deactivate DA
         alt SqlAlchemyException
             Service-->>API: 500 Internal Server Error
-            API-->>UI: Error
+            API-->>SVC: reject(error)
+            SVC-->>UI: Promise rejects → handleError()
             UI-->>User: Error message
         else result is empty
             Service-->>API: []
-            API-->>UI: 200 OK + []
+            API-->>SVC: 200 OK + []
+            SVC-->>UI: Promise resolves []
             UI-->>User: No data found
         else Success
             Service-->>API: output list of dicts
-            API-->>UI: 200 OK + result
+            API-->>SVC: 200 OK + result
+            SVC-->>UI: Promise resolves data
             UI-->>User: Display component data
         end
     end
     deactivate Service
     deactivate API
+    deactivate SVC
     deactivate UI
 
     Note over User,DB: ➕ POST - Detailed Flow
 
     User->>UI: Submit form
     activate UI
-    UI->>API: POST /component {input: [{column_config_id, value}]}
+    UI->>SVC: createData(journey, payload, 'post')
+    activate SVC
+    Note over SVC: Returns Observable via http.post()<br/>Headers: Content-Type + Ocp-Apim-Subscription-Key
+    SVC->>API: POST /component {input: [{column_config_id, value}]}
     activate API
     API->>Service: insert_data(json_object)
     activate Service
@@ -91,7 +103,8 @@ sequenceDiagram
     alt column_config_id not integer
         Utils-->>Service: raise ValueError Invalid Payload
         Service-->>API: raise Exception
-        API-->>UI: HTTPException + detail
+        API-->>SVC: HTTPException + detail
+        SVC-->>UI: handleError() → Observable error
         UI-->>User: Invalid Payload error
     else valid
         Note over Utils,DB: Step 2 - Fetch Field Config from x000003
@@ -99,7 +112,7 @@ sequenceDiagram
         activate DA
         DA->>DB: SELECT from x000003 WHERE column_config_id IN (...)
         activate DB
-        DB-->>DA: field definitions (table_name, parent_table_name, pkey, fkey, column mappings)
+        DB-->>DA: field definitions (table_name, pkey, fkey, column mappings)
         deactivate DB
         DA-->>Utils: response_list
         deactivate DA
@@ -108,7 +121,7 @@ sequenceDiagram
         Utils->>Utils: group columns by table_name
         Utils->>Utils: cast values per column type
         Utils->>Utils: handle geom column as raw WKT
-        Utils->>Utils: sort parent table first (parent_table_name is None)
+        Utils->>Utils: sort parent table first
         Utils-->>Service: insert_list [{table, column_name_value, pkey, fkey}]
         deactivate Utils
     end
@@ -129,7 +142,8 @@ sequenceDiagram
     alt Error
         Service->>DA: session.rollback()
         Service-->>API: raise Exception
-        API-->>UI: HTTPException + mazeresponse detail
+        API-->>SVC: HTTPException + mazeresponse detail
+        SVC-->>UI: handleError() → Observable error
         UI-->>User: Error message
     else Success
         Note over Service,DB: Step 5 - Insert Child Table
@@ -148,7 +162,8 @@ sequenceDiagram
         alt Error
             Service->>DA: session.rollback()
             Service-->>API: raise Exception
-            API-->>UI: HTTPException + mazeresponse detail
+            API-->>SVC: HTTPException + mazeresponse detail
+            SVC-->>UI: handleError() → Observable error
             UI-->>User: Error message
         else Success
             Note over Service,DB: Step 6 - Optional Form/Task Handling
@@ -186,19 +201,24 @@ sequenceDiagram
             DA-->>Service: committed
             deactivate DA
             Service-->>API: {id, status_code, "Data Inserted Successfully"}
-            API-->>UI: 201 Created + response
+            API-->>SVC: 201 Created + response
+            SVC-->>UI: Observable emits result (shareReplay)
             UI-->>User: Success message
         end
     end
     deactivate Service
     deactivate API
+    deactivate SVC
     deactivate UI
 
     Note over User,DB: ✏️ PUT - Detailed Flow
 
     User->>UI: Edit and submit form
     activate UI
-    UI->>API: PUT /component {input: [{column_config_id, value}], id, operation}
+    UI->>SVC: createData(journey, payload, 'put')
+    activate SVC
+    Note over SVC: Returns Observable via http.put()<br/>Headers: Content-Type + Ocp-Apim-Subscription-Key
+    SVC->>API: PUT /component {input: [{column_config_id, value}], id, operation}
     activate API
     API->>Service: update_data(json_object)
     activate Service
@@ -210,7 +230,8 @@ sequenceDiagram
     alt column_config_id not integer
         Utils-->>Service: raise ValueError Invalid Payload
         Service-->>API: raise Exception
-        API-->>UI: HTTPException + detail
+        API-->>SVC: HTTPException + detail
+        SVC-->>UI: handleError() → Observable error
         UI-->>User: Invalid Payload error
     else valid
         Note over Utils,DB: Step 2 - Fetch Field Config from x000003
@@ -218,7 +239,7 @@ sequenceDiagram
         activate DA
         DA->>DB: SELECT from x000003 WHERE column_config_id IN (...)
         activate DB
-        DB-->>DA: field definitions (table_name, parent_table_name, pkey, fkey, column mappings)
+        DB-->>DA: field definitions
         deactivate DB
         DA-->>Utils: response_list
         deactivate DA
@@ -250,7 +271,8 @@ sequenceDiagram
         alt parent_table_name is None
             Service->>DA: session.rollback()
             Service-->>API: {response: "Parent table name is blank"}
-            API-->>UI: 202 Accepted + error response
+            API-->>SVC: 202 Accepted + error response
+            SVC-->>UI: Observable emits error body
             UI-->>User: Configuration error message
         else parent found
             Service->>DA: insert_update_record(session, parent_child_sql, False)
@@ -305,7 +327,8 @@ sequenceDiagram
         deactivate DA
         alt record does not exist
             Service-->>API: raise ValueError(id does not exist)
-            API-->>UI: 404 Not Found
+            API-->>SVC: 404 Not Found
+            SVC-->>UI: handleError() → Observable error
             UI-->>User: Not found error
         else record exists
             Service->>DA: insert_update_record(session, update_sql, False)
@@ -323,7 +346,8 @@ sequenceDiagram
     alt SqlAlchemyException
         Service->>DA: session.rollback()
         Service-->>API: raise SqlAlchemyException
-        API-->>UI: HTTPException + mazeresponse detail
+        API-->>SVC: HTTPException + mazeresponse detail
+        SVC-->>UI: handleError() → Observable error
         UI-->>User: Error message
     else Success
         Service->>DA: session.commit()
@@ -331,10 +355,12 @@ sequenceDiagram
         DA-->>Service: committed
         deactivate DA
         Service-->>API: {response: "Data Inserted/Updated Successfully"}
-        API-->>UI: 202 Accepted + response
+        API-->>SVC: 202 Accepted + response
+        SVC-->>UI: Observable emits result
         UI-->>User: Confirmation message
     end
     deactivate Service
     deactivate API
+    deactivate SVC
     deactivate UI
 ```
